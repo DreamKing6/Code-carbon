@@ -1,0 +1,371 @@
+# app.py
+import streamlit as st
+import pandas as pd
+import numpy as np
+import os
+from datetime import datetime, date, timedelta
+from sklearn.linear_model import LinearRegression
+from sklearn.exceptions import NotFittedError
+import matplotlib.pyplot as plt
+import plotly.express as px
+
+# ---------------------------
+# Config
+# ---------------------------
+DATA_DIR = "data"
+DATA_FILE = os.path.join(DATA_DIR, "usage.csv")
+DATE_FORMAT = "%Y-%m-%d"
+
+st.set_page_config(page_title="EcoSense Dashboard", layout="wide")
+
+# ---------------------------
+# Helpers: Data persistence
+# ---------------------------
+def ensure_data_file():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if not os.path.exists(DATA_FILE):
+        # create sample demo data
+        demo = []
+        today = date.today()
+        users = ["alice", "bob", "charlie"]
+        np.random.seed(42)
+        for i in range(14):
+            d = today - timedelta(days=14 - i)
+            for u in users:
+                elec = max(0.5, np.random.normal(3.5 if u=="alice" else 5.0 if u=="bob" else 2.5, 1.0))
+                water = max(20, np.random.normal(140 if u=="alice" else 200 if u=="bob" else 100, 30))
+                hh = 3 if u!="charlie" else 1
+                demo.append({"name": u, "date": d.strftime(DATE_FORMAT),
+                             "electricity_units": round(elec,2),
+                             "water_liters": int(water),
+                             "household_size": hh})
+        df = pd.DataFrame(demo)
+        df.to_csv(DATA_FILE, index=False)
+
+def load_data():
+    ensure_data_file()
+    df = pd.read_csv(DATA_FILE, parse_dates=["date"])
+    # normalize name lower
+    df["name"] = df["name"].str.strip().str.lower()
+    return df
+
+def append_entry(row: dict):
+    df = load_data()
+    df = df.append(row, ignore_index=True)
+    df.to_csv(DATA_FILE, index=False)
+
+# ---------------------------
+# Scoring & Predictions
+# ---------------------------
+def train_predict_for_user(df_user):
+    """
+    Train a simple linear regression model (y = usage), X = day index.
+    Returns predicted next day value and the model if available.
+    """
+    df_user = df_user.sort_values("date")
+    if len(df_user) < 3:
+        raise NotFittedError("Not enough rows")
+    # day index
+    df_user["day_index"] = (df_user["date"] - df_user["date"].min()).dt.days
+    X = df_user[["day_index"]].values
+    y = df_user["electricity_units"].values.reshape(-1,1)
+    model = LinearRegression()
+    model.fit(X, y)
+    next_day_index = np.array([[df_user["day_index"].max() + 1]])
+    pred = model.predict(next_day_index)[0][0]
+    return float(pred), model
+
+def global_predict(df):
+    """Fallback global model using mean daily usage per day index across all users."""
+    df2 = df.sort_values("date")
+    df2["day_index"] = (df2["date"] - df2["date"].min()).dt.days
+    X = df2[["day_index"]].values
+    y = df2["electricity_units"].values.reshape(-1,1)
+    if len(df2) < 3:
+        return df2["electricity_units"].mean()
+    model = LinearRegression()
+    model.fit(X, y)
+    next_day_index = np.array([[df2["day_index"].max() + 1]])
+    pred = model.predict(next_day_index)[0][0]
+    return float(pred)
+
+def eco_score(latest, predicted):
+    """
+    Produce an EcoScore: higher if latest < predicted.
+    Score range: 0-100. If latest<=predicted -> better score.
+    """
+    if predicted <= 0:
+        return 50
+    diff = predicted - latest
+    pct = diff / predicted  # positive if saved vs predicted
+    # map to 0-100
+    score = 50 + (pct * 50)  # if pct=1 -> 100, pct=-1 -> 0
+    score = max(0, min(100, score))
+    return int(round(score))
+
+# ---------------------------
+# Pattern detection
+# ---------------------------
+def detect_patterns(df_user):
+    """
+    Return list of detected patterns (strings) and severity tags
+    """
+    msgs = []
+    # require at least 3 records to detect trends
+    if len(df_user) < 3:
+        return msgs
+
+    df_user = df_user.sort_values("date")
+    last = df_user.iloc[-1]
+    mean = df_user["electricity_units"].mean()
+    median = df_user["electricity_units"].median()
+
+    # Trend: 3-day increase
+    if len(df_user) >= 3:
+        last3 = df_user["electricity_units"].tail(3).values
+        if last3[0] < last3[1] < last3[2]:
+            msgs.append(("Rising electricity trend over last 3 days", "warning"))
+
+    # Spike: latest > mean * 1.5
+    if last["electricity_units"] > mean * 1.5:
+        msgs.append((f"Sudden electricity spike: {last['electricity_units']} units (mean {mean:.2f})", "alert"))
+
+    # Weekend spike: check weekend averages
+    df_user["weekday"] = df_user["date"].dt.weekday
+    weekend_avg = df_user[df_user["weekday"] >= 5]["electricity_units"].mean() if any(df_user["date"].dt.weekday >=5) else np.nan
+    weekday_avg = df_user[df_user["weekday"] < 5]["electricity_units"].mean() if any(df_user["date"].dt.weekday <5) else np.nan
+    if not np.isnan(weekend_avg) and not np.isnan(weekday_avg) and weekend_avg > weekday_avg * 1.25:
+        msgs.append((f"Higher usage on weekends ({weekend_avg:.1f} units) vs weekdays ({weekday_avg:.1f})", "info"))
+
+    # Water per-person high
+    if "household_size" in df_user.columns and df_user["household_size"].notnull().any():
+        # compute latest per-person water
+        latest_water = df_user.iloc[-1]["water_liters"]
+        hh = df_user.iloc[-1].get("household_size", 1) or 1
+        per_person = latest_water / hh
+        if per_person > 150:
+            msgs.append((f"High water per-person: {per_person:.0f} L/person (threshold 150 L)", "alert"))
+        elif per_person > 100:
+            msgs.append((f"Moderate water per-person: {per_person:.0f} L/person", "info"))
+
+    return msgs
+
+# ---------------------------
+# Suggestions engine
+# ---------------------------
+def generate_suggestions(latest, predicted, df_user):
+    suggestions = []
+    # Electricity suggestion based on difference
+    if latest > predicted:
+        excess = latest - predicted
+        suggestions.append(f"You used {excess:.2f} units more than predicted. Try reducing AC or heavy loads by 30 min to save ~{excess*0.15:.2f} units.")
+    else:
+        savings = predicted - latest
+        suggestions.append(f"Good job! You're {savings:.2f} units under prediction — keep it up. Try maintaining these habits.")
+
+    # Water suggestions per-person
+    hh = df_user.iloc[-1].get("household_size", 1) or 1
+    per_person = df_user.iloc[-1]["water_liters"] / hh
+    if per_person > 150:
+        suggestions.append("Reduce shower time by 2-3 mins or install a low-flow shower head — can save 20-40 L/day per person.")
+    elif per_person > 100:
+        suggestions.append("Consider 1 shorter shower daily or fix minor leaks to reduce water usage.")
+
+    # Standby advice (generic)
+    suggestions.append("Unplug phone chargers and idle appliances at night — standby power can add up.")
+    suggestions.append("Switch to LED bulbs and prefer ceiling fan over AC when comfortable; use natural light where possible.")
+
+    return suggestions
+
+# ---------------------------
+# UI: Sidebar - Input form
+# ---------------------------
+st.sidebar.title("Add daily usage")
+with st.sidebar.form("entry_form", clear_on_submit=True):
+    name = st.text_input("Name (unique)", value="", help="Enter your name or student id").lower().strip()
+    d = st.date_input("Date", value=date.today())
+    elec = st.number_input("Electricity (units/kWh)", min_value=0.0, max_value=100.0, value=3.0, step=0.1)
+    water = st.number_input("Water (liters)", min_value=0, max_value=10000, value=120, step=1)
+    hh_size = st.number_input("Household size (people)", min_value=1, max_value=20, value=3, step=1)
+    submitted = st.form_submit_button("Save entry")
+    if submitted:
+        if name == "":
+            st.warning("Please enter a name.")
+        else:
+            row = {"name": name, "date": d.strftime(DATE_FORMAT),
+                   "electricity_units": float(round(elec,2)),
+                   "water_liters": int(water),
+                   "household_size": int(hh_size)}
+            append_entry(row)
+            st.success(f"Saved data for {name} on {d.isoformat()}")
+
+# ---------------------------
+# Main layout
+# ---------------------------
+st.title("🌱 EcoSense — Student Multi-User Resource Dashboard (Streamlit)")
+st.markdown(
+    "Track electricity & water usage, predict tomorrow's usage, detect wasteful patterns, and get personalized saving suggestions."
+)
+
+df = load_data()
+
+# user selector
+st.sidebar.title("View / Filter")
+users = sorted(df["name"].unique().tolist())
+users_display = ["All users"] + users
+selected_user = st.sidebar.selectbox("Select user", options=users_display, index=0)
+date_range = st.sidebar.date_input("Date range", value=(date.today()-timedelta(days=13), date.today()))
+
+# filter by date
+start_date, end_date = date_range
+mask = (df["date"] >= pd.to_datetime(start_date)) & (df["date"] <= pd.to_datetime(end_date))
+dff = df[mask].copy()
+
+# MAIN COLUMNS
+col1, col2 = st.columns([2,1])
+
+with col1:
+    st.header("Usage Trends")
+    if selected_user != "All users":
+        user = selected_user.lower()
+        df_user = dff[dff["name"] == user].sort_values("date")
+        if df_user.empty:
+            st.info("No data for this user in selected range. Add entries in the sidebar.")
+        else:
+            # Electricity trend
+            st.subheader(f"Electricity trend — {user}")
+            fig = px.line(df_user, x="date", y="electricity_units", markers=True,
+                          title="Electricity Units over time")
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Water trend
+            st.subheader("Water usage")
+            fig2 = px.bar(df_user, x="date", y="water_liters", title="Water (liters)")
+            st.plotly_chart(fig2, use_container_width=True)
+
+            # Stats
+            st.subheader("Summary")
+            latest_row = df_user.iloc[-1]
+            st.metric("Latest electricity (units)", f"{latest_row['electricity_units']:.2f}")
+            st.metric("Latest water (L)", f"{latest_row['water_liters']:,}")
+
+            # ML prediction (try per-user, fallback global)
+            try:
+                pred, model = train_predict_for_user(df_user[["date","electricity_units"]].rename(columns={"electricity_units":"electricity_units"}))
+                st.write(f"Predicted electricity for next day: **{pred:.2f} units** (user model)")
+            except Exception:
+                pred = global_predict(df[["date","electricity_units"]])
+                st.write(f"Predicted electricity for next day: **{pred:.2f} units** (global model fallback)")
+
+            # EcoScore
+            score = eco_score(latest_row["electricity_units"], pred)
+            st.progress(score/100)
+            st.write(f"EcoScore (comparing latest vs prediction): **{score}/100**")
+
+            # Patterns
+            st.subheader("Wastage Patterns")
+            patterns = detect_patterns(df_user[["date","electricity_units","water_liters","household_size"]])
+            if patterns:
+                for p,level in patterns:
+                    if level=="alert":
+                        st.error(p)
+                    elif level=="warning":
+                        st.warning(p)
+                    else:
+                        st.info(p)
+            else:
+                st.success("No major patterns detected — nice!")
+
+            # Suggestions
+            st.subheader("Personalized suggestions")
+            suggestions = generate_suggestions(latest_row["electricity_units"], pred, df_user)
+            for s in suggestions:
+                st.write("•", s)
+
+            # What-if calculator
+            st.subheader("What-If Calculator")
+            st.write("Try adjustments and see estimated savings.")
+            colA, colB, colC = st.columns(3)
+            with colA:
+                reduce_ac = st.slider("Reduce AC (hours/day)", 0.0, 4.0, 0.5, step=0.25)
+            with colB:
+                reduce_shower = st.slider("Shorter shower (mins/day)", 0, 10, 2, step=1)
+            with colC:
+                switch_led = st.checkbox("Switch 3 bulbs to LED (approx.)", value=False)
+            # simple estimation rules:
+            est_savings_units = reduce_ac * 0.8  # approximate 0.8 units per hour saved
+            est_savings_liters = reduce_shower * 10  # 10 L per minute saved (approx)
+            if switch_led:
+                est_savings_units += 0.5  # small daily saving for bulbs
+            st.write(f"Estimated electricity saving/day: **{est_savings_units:.2f} units**")
+            st.write(f"Estimated water saving/day: **{est_savings_liters:.0f} L**")
+
+    else:
+        # Aggregate "All users" view
+        st.subheader("All users overview")
+        if dff.empty:
+            st.info("No data in selected range.")
+        else:
+            # show top chart: average electricity per day
+            agg = dff.groupby("date").agg({"electricity_units":"mean","water_liters":"mean"}).reset_index()
+            fig_all = px.line(agg, x="date", y="electricity_units", title="Average Electricity (all users)")
+            st.plotly_chart(fig_all, use_container_width=True)
+            fig_all_w = px.line(agg, x="date", y="water_liters", title="Average Water (all users)")
+            st.plotly_chart(fig_all_w, use_container_width=True)
+
+with col2:
+    st.header("Leaderboard & Users")
+    st.markdown("EcoScore leaderboard (last 7 days)")
+    # compute last 7 days per-user eco score
+    last7 = df[df["date"] >= (pd.to_datetime(date.today()) - pd.Timedelta(days=7))]
+    users_scores = []
+    for u in last7["name"].unique():
+        du = last7[last7["name"] == u].sort_values("date")
+        if du.empty:
+            continue
+        latest = du.iloc[-1]["electricity_units"]
+        try:
+            pred, _ = train_predict_for_user(du[["date","electricity_units"]].rename(columns={"electricity_units":"electricity_units"}))
+        except Exception:
+            pred = global_predict(df)
+        score = eco_score(latest, pred)
+        users_scores.append({"name": u, "score": score,
+                             "latest": latest,
+                             "pred": round(pred,2)})
+    if users_scores:
+        leaderboard = pd.DataFrame(users_scores).sort_values("score", ascending=False)
+        st.table(leaderboard.reset_index(drop=True))
+    else:
+        st.info("No data for last 7 days to build leaderboard.")
+
+    st.markdown("---")
+    st.subheader("Users quick stats")
+    if users:
+        selected_user_quick = st.selectbox("Quick select user for details:", options=users)
+        u = selected_user_quick
+        du = df[df["name"] == u].sort_values("date")
+        st.write(f"Records: {len(du)} | First: {du['date'].min().date() if len(du)>0 else 'N/A'} | Last: {du['date'].max().date() if len(du)>0 else 'N/A'}")
+        st.write("Average electricity (all-time):", round(du["electricity_units"].mean(),2) if len(du)>0 else "N/A")
+        st.write("Average water (all-time):", int(du["water_liters"].mean()) if len(du)>0 else "N/A")
+    else:
+        st.info("No users yet. Add entries from the sidebar.")
+
+# ---------------------------
+# Export / Admin utilities
+# ---------------------------
+st.markdown("---")
+st.header("Admin / Export")
+colx, coly = st.columns(2)
+with colx:
+    st.write("Download raw data")
+    csv = df.to_csv(index=False)
+    st.download_button("Download CSV", data=csv, file_name="eco_usage.csv")
+with coly:
+    st.write("Reset data (danger!)")
+    if st.checkbox("I understand this will delete data"):
+        if st.button("Reset data file"):
+            os.remove(DATA_FILE)
+            ensure_data_file()
+            st.success("Data reset to demo data. Reload the app to see changes.")
+
+st.markdown("**Notes:** This demo uses a simple linear model for prediction and rule-based suggestions. For production, use hourly submetering data and robust models. Good luck and bring home the prize! 🏆")
