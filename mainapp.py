@@ -1,4 +1,6 @@
 import streamlit
+import shelve
+from matplotlib import pyplot
 #from langchain_google_genai import ChatGoogleGenerativeAI
 #from langchain.prompts import ChatPromptTemplate
 #from langchain.output_parsers import JsonOutputParser
@@ -59,12 +61,30 @@ Do NOT add any extra text AT ALL, ONLY return the JSON with datas. If there's mi
 #    ("user", "{input}")
 #])
 #parser = JsonOutputParser()
-#chain = prompt | dataFetcher 
-
-streamlit.title("Electricity Watcher")
-streamlit.header("Electricity Watcher")
+#chain = prompt | dataFetcher
+DB = shelve.open("DB") 
+LOGGED_IN = False
+USABLE_DICT = {}
+streamlit.title("Eco Saver")
 streamlit.subheader("Monitor your electricity usage in your home and save MONEY!")
-textInput = streamlit.text_area("Enter your daily activities! Describe how much ACs you have, and for how much times you run it, and the same with Heaters. Also input the duration of usage of microwaves, induction stoves, and water pump motors.")
-if streamlit.button("Calculate ts"):
-    res = model.generate_content(returnPrompt(textInput))
-    streamlit.write(res.text)
+if True:
+    usrname = streamlit.text_input("Enter your username:")
+    if streamlit.button("Login!"):
+        if usrname != "": 
+            LOGGED_IN = True
+            DB[usrname] = []
+        textInput = streamlit.text_area("Enter your daily activities! Describe how much ACs you have, and for how much times you run it, and the same with Heaters. Also input the duration of usage of microwaves, induction stoves, and water pump motors.")
+        if streamlit.button("Calculate ts"):
+            res = model.generate_content(returnPrompt(textInput))
+            info = eval(res.text)
+            fig, axes = pyplot.subplots()
+            axes.set_xlabel("Users")
+            axes.set_ylabel("Electricity Usage")
+            for i in range(4):
+                USABLE_DICT[[dict(DB).keys()[len(dict(DB).keys())-i]]] = dict(DB).values()[len(dict(DB).values())-i]
+            #for i in dict(USABLE_DICT).keys():
+            axes.plot(USABLE_DICT.keys(), USABLE_DICT.values(), marker="*", linestyle="--")
+            axes.plot(USABLE_DICT.keys(), [info["avg_ec_cons_house"]] * len(USABLE_DICT), marker="o", linestyle="solid" )
+
+
+DB.close()
